@@ -19,17 +19,19 @@ import numpy as np
 from alexnet import AlexNet
 from datagenerator import ImageDataGenerator
 import datagenerator
-
+import mutan_block as mb
 
 Iterator = tf.data.Iterator
 valmode = True # Use full taget set for evaluation
 display_step = 15
 
+proj_dim = 1024
+config = [20, 20, 20, 20]
 height = datagenerator.image_height
 width = datagenerator.image_width
 
-source_file = './testtxt/amazon.txt'
-target_file = './testtxt/dslr.txt'
+source_file = './testtxt/dslr.txt'
+target_file = './testtxt/amazon.txt'
 size = len(open(source_file).readlines())
 
 class AdversarialNet(AlexNet):
@@ -44,8 +46,9 @@ class AdversarialNet(AlexNet):
         self.lamda = lamda
         self.KEEP_PROB_TRAINING = 0.5
         self.KEEP_PROB_VALIDATION = 1.0
-        self.create()
+        #self.create()
         #self.create_block()
+        self.create_mutan()
         
     def create(self):
         super().create()
@@ -99,28 +102,31 @@ class AdversarialNet(AlexNet):
         x = self.fc(x, dimension[1], dimension[1], "adversarial_" + name + "_layer_2")
         if source_file == './testtxt/amazon.txt':
             x = self.dropout(x, self.keep_prob)
-        x = tf.layers.dense(x, 1, activation = tf.nn.sigmoid, kernel_initializer=tf.truncated_normal_initializer(stddev=0.01), use_bias=True, name = "adversarial_" + name + "_layer_3")
+        x = tf.layers.dense(x, 1, kernel_initializer=tf.truncated_normal_initializer(stddev=0.01), use_bias=True, name = "adversarial_" + name + "_layer_3")
         
         return x
     
-    def mutan_adversarial_net(self, x, y, dimension, name = 'feature'):
-        with tf.variable_scope('adversarial') as scope:
-            # Create tf variables for the weights and biases of the conv layer
-            weights = tf.get_variable('weights', shape = [self.rep_dim, self.n_class, dimension[0]])
-            biases = tf.get_variable('biases', shape = [dimension[0]]) 
+    def create_mutan(self):
+        super().create()
             
-            x = tf.matmul(tf.tensordot(x, weights, [[1], [0]]), y) + biases 
-            x = tf.nn.relu(x, name = scope.name)
-            
-            x = self.dropout(x, self.keep_prob)
-            x = self.fc(x, dimension[0], dimension[1], name + "_layer_2")
-            x = self.dropout(x, self.keep_prob)
-            x = tf.layers.dense(x, 1, activation = tf.nn.sigmoid, kernel_initializer=tf.truncated_normal_initializer(stddev=0.01), use_bias=True, name = name + "_layer_3")
+        self.bottleneck = self.fc(self.dropout7, 4096, self.rep_dim, name = "adapt/bottleneck")
+        self.dropout_bottleneck = self.dropout(self.bottleneck, self.keep_prob)
+        self.logits = tf.layers.dense(self.dropout_bottleneck, units=self.n_class, kernel_initializer=tf.truncated_normal_initializer(stddev=0.01), use_bias=True, name="adapt/fc8")
         
-        return x
+        self.source_classify, self.target_classifiy = tf.split(self.logits, [self.n_source, self.n_target])
+
+        self.discriminator = self.mutan_adversarial_net(self.bottleneck, self.logits, [proj_dim, 1024], name = "feature")
+        
+        #self.source_logits, self.target_logits = tf.split(discriminator, [self.n_source, self.n_target])
+    
+    def mutan_adversarial_net(self, x, y, dimension, name = 'feature'):
+        rep = mb.mutan_block(x, y, self.rep_dim, self.n_class, dimension[0], config)
+        rep = self.adversarial_net(rep, dimension, name = name)
+        return rep
+        #return tf.nn.l2_normalize(tf.nn.relu(rep) - tf.nn.relu(-rep), axis = -1)
         
     #init_lr = 1e-3, init_lr= 0.0003
-    def training(self, source_file, target_file, init_lr = 1e-3, training_epochs = 500, batch_size = 100, batch_test = 100):
+    def training(self, source_file, target_file, init_lr = 5e-4, training_epochs = 1000, batch_size = 100, batch_test = 100):
         
         sess = tf.Session()
         """
@@ -130,10 +136,12 @@ class AdversarialNet(AlexNet):
         """
         one_hot_labels = tf.placeholder(tf.float32, [None, self.n_class])
         lr = tf.placeholder(tf.float32)
+        domain_label = tf.concat([tf.ones([self.n_source, 1]), tf.zeros([self.n_target, 1])], axis = 0)
         
         weight_decay = 0.0005 / 2 * tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables() if ('weight' in v.name) or ('kernel' in v.name)])
-        prediction_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(logits = self.source_classify, labels = one_hot_labels))
-        adver_loss = - (tf.reduce_mean(tf.log(self.source_logits)) + tf.reduce_mean(tf.log(1 - self.target_logits)))
+        #prediction_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(logits = self.source_classify, labels = one_hot_labels))
+        prediction_loss = tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(logits = self.source_classify, labels = tf.argmax(one_hot_labels, 1)))
+        adver_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits = self.discriminator, labels = domain_label))
         loss = prediction_loss + weight_decay - self.lamda * adver_loss
                 
         """
@@ -154,6 +162,8 @@ class AdversarialNet(AlexNet):
         
         min_gradients = tf.gradients(loss, min_var_list)
         adv_gradients = tf.gradients(adver_loss, adv_var_list)
+        #min_gradients, _ = tf.clip_by_global_norm(min_gradients, 5.0)
+        #adv_gradients, _ = tf.clip_by_global_norm(adv_gradients, 5.0)
         min_gradients = list(zip(min_gradients, min_var_list))
         adv_gradients = list(zip(adv_gradients, adv_var_list))
         
@@ -250,6 +260,8 @@ class AdversarialNet(AlexNet):
                 
         self.load_initial_weight(sess)
         
+        print(config)
+        print(init_lr)
         print(train_batches_per_epoch)
         print(val_batches_per_epoch)
         print(source_file, target_file)
@@ -328,5 +340,12 @@ class AdversarialNet(AlexNet):
             
         print (best)
 
+if source_file == './testtxt/dslr.txt':
+    training_epochs = 800
+elif source_file == './testtxt/webcam.txt' :
+    training_epochs = 600
+else:
+    training_epochs = 400 
+    
 net = AdversarialNet(tf.placeholder(dtype = tf.float32, shape = [None, height, width, 3]), tf.placeholder(dtype = tf.float32, shape = [None, height, width, 3]))
-net.training(source_file, target_file)
+net.training(source_file, target_file, training_epochs = training_epochs)
