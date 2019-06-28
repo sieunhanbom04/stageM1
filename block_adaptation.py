@@ -22,8 +22,8 @@ display_step = 15
 height = datagenerator.image_height
 width = datagenerator.image_width
 
-source_file = './testtxt/webcam.txt'
-target_file = './testtxt/amazon.txt'
+source_file = './testtxt/dslr.txt'
+target_file = './testtxt/webcam.txt'
 size = len(open(source_file).readlines())
 
 class AdaptNet(AlexNet):
@@ -39,7 +39,9 @@ class AdaptNet(AlexNet):
         self.mode = mode
         self.KEEP_PROB_TRAINING = 0.5
         self.KEEP_PROB_VALIDATION = 1.0
-        self.create()
+        #self.create()
+        #self.create_block_ver2()
+        self.create_block_ver3()
         
     def create(self):
         super().create()
@@ -74,6 +76,44 @@ class AdaptNet(AlexNet):
             
             print(self.bottleneck)
     #Gaussian Kernel
+    
+    def create_block_ver2(self):
+        super().create()
+        
+        adapt = self.fc(self.dropout7, 4096, self.rep_dim * 2, name = "adapt/main_block1")
+        adapt = self.fc(adapt, self.rep_dim * 2, self.rep_dim, name = "adapt/main_block2")
+        adapt_source, adapt_target = tf.split(adapt, [self.n_source, self.n_target])
+        fc7_source, fc7_target = tf.split(self.dropout7, [self.n_source, self.n_target])
+            
+        adapt_source = self.fc(fc7_source, 4096, self.rep_dim, name = "adapt/skip_connection_source")
+        adapt_feature = self.fc(fc7_target, 4096, self.rep_dim, name = "adapt/skip_connection_target")
+            
+        self.source_feature = adapt_source + adapt_source
+        self.target_feature = adapt_feature + adapt_target
+        
+        self.fc8 = tf.concat([self.source_feature, self.target_feature], axis = 0) 
+        
+        #Feature and logits extraction
+        self.dropout8 = self.dropout(self.fc8, self.keep_prob)
+        self.logits = tf.layers.dense(self.dropout8, units=self.n_class, kernel_initializer=tf.truncated_normal_initializer(stddev=0.01), use_bias=True, name="adapt/fc8")
+        self.skip_layer = ['fc8', 'adapt']
+        
+    def create_block_ver3(self):
+        super().create()
+        
+        adapt = self.fc(self.dropout7, 4096, self.rep_dim * 2, name = "adapt/main_block1")
+        adapt = self.fc(adapt, self.rep_dim * 2, self.rep_dim, name = "adapt/main_block2")
+        adapt_source, adapt_target = tf.split(adapt, [self.n_source, self.n_target])
+        
+        self.source_feature = adapt_source
+        self.target_feature = adapt_target + self.fc(adapt_target, self.rep_dim, self.rep_dim, name = "adapt/projection")
+        
+        self.fc8 = tf.concat([self.source_feature, self.target_feature], axis = 0) 
+        
+        #Feature and logits extraction
+        self.dropout8 = self.dropout(self.fc8, self.keep_prob)
+        self.logits = tf.layers.dense(self.dropout8, units=self.n_class, kernel_initializer=tf.truncated_normal_initializer(stddev=0.01), use_bias=True, name="adapt/fc8")
+        self.skip_layer = ['fc8', 'adapt']
     
     def gaussian_kernel(self, source, target, kernel_mul = 2.0, kernel_num = 5, fix_sigma = None):
         total = tf.concat([source, target], axis = 0)
@@ -236,9 +276,19 @@ class AdaptNet(AlexNet):
         elif 'JAN' in self.mode:
             source_logits, target_logits = tf.split(self.logits, [self.n_source, self.n_target])
             prediction_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(logits = source_logits, labels = one_hot_labels))
-            MMD_loss = self.JLGAN_MMD([self.source_feature, tf.nn.softmax(source_logits, axis = -1)], [self.target_feature, tf.nn.softmax(target_logits, axis = -1)])
+            MMD_loss = self.JAN_MMD([self.source_feature, tf.nn.softmax(source_logits, axis = -1)], [self.target_feature, tf.nn.softmax(target_logits, axis = -1)])
             #MMD_loss = 2 * self.MJAN_MMD(self.source_feature, self.target_feature, tf.nn.softmax(source_logits, axis = -1), tf.nn.softmax(target_logits, axis = -1))
-            loss = prediction_loss + 0.0005 / 2 * tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables() if ('weight' in v.name) or ('kernel' in v.name)]) + self.lamda * MMD_loss
+            """
+            skip_source_w = [v for v in tf.trainable_variables() if ('adapt/skip_connection_source/weights' in v.name)][0]
+            skip_source_b = [v for v in tf.trainable_variables() if ('adapt/skip_connection_source/biases' in v.name)][0]
+            skip_target_w = [v for v in tf.trainable_variables() if ('adapt/skip_connection_target/weights' in v.name)][0]
+            skip_target_b = [v for v in tf.trainable_variables() if ('adapt/skip_connection_target/biases' in v.name)][0]
+            
+            difference_loss = (tf.reduce_sum(tf.square(skip_source_w - skip_target_w)) + tf.reduce_sum(tf.square(skip_source_b - skip_target_b)))
+            """
+            
+            difference_loss = tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables() if 'projection' in v.name])
+            loss = prediction_loss + 0.0005 / 2 * tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables() if ('weight' in v.name) or ('kernel' in v.name)]) + self.lamda * MMD_loss + difference_loss
         
         print("check:", [v for v in tf.trainable_variables() if ('weight' in v.name) or ('kernel' in v.name)])
         """
@@ -364,6 +414,7 @@ class AdaptNet(AlexNet):
             L_pred = 0
             L_total = 0
             L_MMD = 0
+            L_diff = 0
             
             for times in range(train_batches_per_epoch):
                 if times_pass == val_batches_per_epoch - 1:
@@ -375,7 +426,7 @@ class AdaptNet(AlexNet):
                 p = 0.5 * epochs / training_epochs # + times/train_batches_per_epoch/training_epochs
                 learning_rate = init_lr / (1. + 10.0 * p)**0.75
                 #print(learning_rate)
-                alpha = 2.0 / (1 + np.exp(-10.0 * epochs / training_epochs)) - 1
+                alpha = 0.5#2.0 / (1 + np.exp(-10.0 * epochs / training_epochs)) - 1 #min(0.45, 2.0 / (1 + np.exp(-10.0 * epochs / training_epochs)) - 1)
                 b = 1.0 * epochs / training_epochs
                 
                 x1, y1 = sess.run(next_batch_sr)
@@ -392,19 +443,23 @@ class AdaptNet(AlexNet):
                     _, total_loss, pred_loss = sess.run([optimize, loss, prediction_loss], feed_dict = {self.source: x1, self.target : x2,
                                             one_hot_labels : y1, lr : learning_rate, self.keep_prob : self.KEEP_PROB_TRAINING, self.lamda : alpha, self.beta : b})
                 elif self.mode == 'JAN':
-                     _, total_loss, pred_loss, M_loss = sess.run([optimize, loss, prediction_loss, MMD_loss], feed_dict = {self.source: x1, self.target : x2,
+                     _, total_loss, pred_loss, M_loss, diff_loss = sess.run([optimize, loss, prediction_loss, MMD_loss, difference_loss], feed_dict = {self.source: x1, self.target : x2,
                                             one_hot_labels : y1, lr : learning_rate, self.keep_prob : self.KEEP_PROB_TRAINING, self.lamda : alpha})
                 
                 L_pred = L_pred + pred_loss
                 L_total = L_total + total_loss
                 L_MMD = L_MMD + M_loss
+                L_diff = L_diff + diff_loss
                 
     
-            if not (epochs % 5 == 4):
+            if not (epochs % 10 == 9):
                 continue
             
             #print(sess.run([v for v in tf.trainable_variables() if 'conv1/weights' in v.name]))
-            print(L_pred * 1.0 / train_batches_per_epoch, L_MMD / train_batches_per_epoch)
+            print(L_pred * 1.0 / train_batches_per_epoch)
+            print(L_MMD / train_batches_per_epoch)
+            print(L_diff / train_batches_per_epoch)
+            print(alpha)
             print("TIMES: ", epochs, " LOSS: ", L_total * 1.0 / train_batches_per_epoch)
             
             sess.run(validation_init_op)
@@ -422,7 +477,7 @@ class AdaptNet(AlexNet):
                     acc, num_ = sess.run([accuracy, accunum], feed_dict={self.source: img_batch, self.target : np.zeros(shape = (0,height, width,3), dtype = np.float32), 
                                                 one_hot_labels: label_batch, self.keep_prob : self.KEEP_PROB_VALIDATION, self.beta : 1.0})
                 elif self.mode == 'JAN':
-                    acc, num_ = sess.run([accuracy, accunum], feed_dict={self.source: img_batch, self.target : np.zeros(shape = (0,height, width,3), dtype = np.float32), 
+                    acc, num_ = sess.run([accuracy, accunum], feed_dict={self.target: img_batch, self.source : np.zeros(shape = (0,height, width,3), dtype = np.float32), 
                                                 one_hot_labels: label_batch, self.keep_prob : self.KEEP_PROB_VALIDATION})
                     
                 test_acc += acc
@@ -433,5 +488,12 @@ class AdaptNet(AlexNet):
             
         print (best)
 
+if source_file == './testtxt/dslr.txt':
+    training_epochs = 700
+elif source_file == './testtxt/webcam.txt' :
+    training_epochs = 600
+else:
+    training_epochs = 400 
+
 net = AdaptNet(tf.placeholder(dtype = tf.float32, shape = [None, height, width, 3]), tf.placeholder(dtype = tf.float32, shape = [None, height, width, 3]))
-net.fine_tuning_training(source_file, target_file)
+net.fine_tuning_training(source_file, target_file, training_epochs = training_epochs)

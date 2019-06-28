@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Mon Apr 15 10:22:02 2019
-
-@author: quoctung
-"""
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Apr  4 10:19:01 2019
+Created on Mon May  6 15:46:59 2019
 
 @author: quoctung
 """
 
 import tensorflow as tf
-
 import numpy as np
 from alexnet import AlexNet
-from datagenerator import ImageDataGenerator
-import datagenerator
+from adversarialMMD import AdversarialNet
+from ResNet_datagenerator import ImageDataGenerator
+from tensorflow.keras.preprocessing import image
+from tensorflow.keras.layers import Dropout, Flatten, Dense
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
+from tensorflow.keras.callbacks import TensorBoard, EarlyStopping
+from tensorflow.keras import backend as K
+from tensorflow.keras.applications.resnet50 import preprocess_input
 import mutan_block as mb
+from tensorflow.keras.applications.resnet50 import ResNet50
 import time
+import gc
 
 Iterator = tf.data.Iterator
 valmode = True # Use full taget set for evaluation
@@ -29,14 +30,14 @@ display_step = 15
 
 proj_dim = 1024
 config = [20, 20, 20, 20]
-height = datagenerator.image_height
-width = datagenerator.image_width
+size = 224
+height = 224
+width = 224
 
 source_file = './testtxt/amazon.txt'
-target_file = './testtxt/dslr.txt'
-size = len(open(source_file).readlines())
+target_file = './testtxt/webcam.txt'
 
-class AdversarialNet(AlexNet):
+class AdResNet(AdversarialNet):
     def __init__(self, source, target, beta = tf.placeholder(tf.float32), keep_prob = tf.placeholder(tf.float32), dimension = 256, lamda = tf.placeholder(tf.float32), skip_layer = ['fc8'], n_class = 31, weight_path = "bvlc_alexnet.npy"):
         self.source = source
         self.target = target
@@ -48,56 +49,53 @@ class AdversarialNet(AlexNet):
         self.lamda = lamda
         self.KEEP_PROB_TRAINING = 0.5
         self.KEEP_PROB_VALIDATION = 1.0
-        #self.create()
-        self.create_block(2)
-        #self.create_block(1,1)
-        #self.create_block(1)
-        #self.create_block()
-        #self.create_mutan()
+        self.pretrain_weight = {}
         
     def create(self):
-        super().create()
+        self.model = ResNet50(include_top = False, weights = 'imagenet', pooling = 'avg', input_tensor = self.X)
+        self.model.trainable = True
+        for layer in self.model.layers:
+            self.pretrain_weight[layer.name] = self.model.get_layer(layer.name).get_weights()
+        print(self.model.get_layer('res5c_branch2a').get_weights())
+        output_resnet = self.model(self.X)
             
-        self.bottleneck = self.fc(self.dropout7, 4096, self.rep_dim, name = "adapt/bottleneck")
-        self.dropout_bottleneck = self.dropout(self.bottleneck, self.keep_prob)
-        self.logits = tf.layers.dense(self.dropout_bottleneck, units=self.n_class, kernel_initializer=tf.truncated_normal_initializer(stddev=0.01), use_bias=True, name="adapt/fc8")
+        self.bottleneck = self.fc(output_resnet, 2048, self.rep_dim, name = "adapt/bottleneck")
+        #self.dropout_bottleneck = self.dropout(self.bottleneck, self.keep_prob)
+        self.logits = tf.layers.dense(self.bottleneck, units=self.n_class, kernel_initializer=tf.truncated_normal_initializer(stddev=0.01), use_bias=True, name="adapt/fc8")
         
         self.source_classify, self.target_classifiy = tf.split(self.logits, [self.n_source, self.n_target])
         
         ad_input = tf.matmul(tf.expand_dims(self.bottleneck, axis = -1), tf.expand_dims(tf.nn.softmax(self.logits, axis = -1), axis = -1), transpose_b = True)
         ad_input = tf.reshape(ad_input, [-1, self.rep_dim * self.n_class])
         self.discriminator = self.adversarial_net(ad_input, [self.rep_dim * self.n_class, 1024], name = "feature")
-        
-        #self.source_logits, self.target_logits = tf.split(discriminator, [self.n_source, self.n_target])
-        
-        print(self.bottleneck)
+                
+        print(output_resnet)
     
-    #Version 0: Domain adaptation with beta
-    #Version 1: Domain adaptation with different projection
     def create_block(self, version = 0, cdan = 0):
-        super().create()
+        self.model = ResNet50(include_top = False, weights = 'imagenet', pooling = 'avg', input_tensor = self.X)
+        self.model.trainable = True
+        for layer in self.model.layers:
+            self.pretrain_weight[layer.name] = self.model.get_layer(layer.name).get_weights()
+        output_resnet = self.model(self.X)
         
-        adapt = self.fc(self.dropout7, 4096, self.rep_dim * 2, name = "adapt/main_block1")
+        adapt = self.fc(output_resnet, 2048, self.rep_dim * 2, name = "adapt/main_block1")
         adapt = self.fc(adapt, self.rep_dim * 2, self.rep_dim, name = "adapt/main_block2")
         adapt_source, adapt_target = tf.split(adapt, [self.n_source, self.n_target])
         if version == 0:
-            fc7_skip = self.fc(self.dropout7, 4096, self.rep_dim, name = "adapt/skip_connection")
+            fc7_skip = self.fc(output_resnet, 2048, self.rep_dim, name = "adapt/skip_connection")
         
             fc7_skip_source, fc7_skip_target = tf.split(fc7_skip, [self.n_source, self.n_target])
         
             self.source_feature = fc7_skip_source + self.beta * adapt_source
             self.target_feature = fc7_skip_target + adapt_target
-        elif version == 1:
-            fc7_source, fc7_target = tf.split(self.dropout7, [self.n_source, self.n_target])
+        else:
+            fc7_source, fc7_target = tf.split(output_resnet, [self.n_source, self.n_target])
             
-            adapt_source = self.fc(fc7_source, 4096, self.rep_dim, name = "adapt/skip_connection_source")
-            adapt_feature = self.fc(fc7_target, 4096, self.rep_dim, name = "adapt/skip_connection_target")
+            adapt_source = self.fc(fc7_source, 2048, self.rep_dim, name = "adapt/skip_connection_source")
+            adapt_feature = self.fc(fc7_target, 2048, self.rep_dim, name = "adapt/skip_connection_target")
             
             self.source_feature = adapt_source + adapt_source
             self.target_feature = adapt_feature + adapt_target
-        else:
-            self.source_feature = adapt_source
-            self.target_feature = adapt_target + self.fc(adapt_target, self.rep_dim, self.rep_dim, name = "adapt/projection")
         
         self.bottleneck = tf.concat([self.source_feature, self.target_feature], axis = 0) 
         self.dropout_bottleneck = self.dropout(self.bottleneck, self.keep_prob)
@@ -111,44 +109,52 @@ class AdversarialNet(AlexNet):
             self.discriminator = self.adversarial_net(ad_input, [self.rep_dim * self.n_class, 1024], name = "feature")
         else:
             self.discriminator = self.mutan_adversarial_net(self.bottleneck, self.logits, [proj_dim, 1024], name = "feature")
+        
         #self.source_logits, self.target_logits = tf.split(discriminator, [self.n_source, self.n_target])
         
         print(self.bottleneck)
     
+    
     def adversarial_net(self, x, dimension, name = "feature"):
-        x = self.fc(x, dimension[0], dimension[1], "adversarial_" + name + "_layer_1")
-        if source_file == './testtxt/amazon.txt':
-            x = self.dropout(x, self.keep_prob)
-        x = self.fc(x, dimension[1], dimension[1], "adversarial_" + name + "_layer_2")
-        if source_file == './testtxt/amazon.txt':
-            x = self.dropout(x, self.keep_prob)
+        x = self.dropout(x, self.keep_prob)
+        x = self.fc(x, dimension[0], dimension[1], "adversarial_" + name + "_layer_2")
+        x = self.dropout(x, self.keep_prob)
         x = tf.layers.dense(x, 1, kernel_initializer=tf.truncated_normal_initializer(stddev=0.01), use_bias=True, name = "adversarial_" + name + "_layer_3")
         
         return x
-    
-    def create_mutan(self):
-        super().create()
-            
-        self.bottleneck = self.fc(self.dropout7, 4096, self.rep_dim, name = "adapt/bottleneck")
-        self.dropout_bottleneck = self.dropout(self.bottleneck, self.keep_prob)
-        self.logits = tf.layers.dense(self.dropout_bottleneck, units=self.n_class, kernel_initializer=tf.truncated_normal_initializer(stddev=0.01), use_bias=True, name="adapt/fc8")
-        
-        self.source_classify, self.target_classifiy = tf.split(self.logits, [self.n_source, self.n_target])
-
-        self.discriminator = self.mutan_adversarial_net(self.bottleneck, self.logits, [proj_dim, 1024], name = "feature")
-        
-        #self.source_logits, self.target_logits = tf.split(discriminator, [self.n_source, self.n_target])
     
     def mutan_adversarial_net(self, x, y, dimension, name = 'feature'):
         rep = mb.mutan_block(x, y, self.rep_dim, self.n_class, dimension[0], config)
         rep = self.adversarial_net(rep, dimension, name = name)
         return rep
-        #return tf.nn.l2_normalize(tf.nn.relu(rep) - tf.nn.relu(-rep), axis = -1)
+    
+    def create_mutan(self):
+        self.model = ResNet50(include_top = False, weights = 'imagenet', pooling = 'avg', input_tensor = self.X)
+        self.model.trainable = True
+        for layer in self.model.layers:
+            self.pretrain_weight[layer.name] = self.model.get_layer(layer.name).get_weights()
+        print(self.model.get_layer('res5c_branch2a').get_weights())
+        output_resnet = self.model(self.X)
+            
+        self.bottleneck = self.fc(output_resnet, 2048, self.rep_dim, name = "adapt/bottleneck")
+        #self.dropout_bottleneck = self.dropout(self.bottleneck, self.keep_prob)
+        self.logits = tf.layers.dense(self.bottleneck, units=self.n_class, kernel_initializer=tf.truncated_normal_initializer(stddev=0.01), use_bias=True, name="adapt/fc8")
         
+        self.source_classify, self.target_classifiy = tf.split(self.logits, [self.n_source, self.n_target])
+        
+        self.discriminator = self.mutan_adversarial_net(self.bottleneck, self.logits, [proj_dim, 1024], name = "feature")
+    
+
     #init_lr = 1e-3, init_lr= 0.0003
-    def training(self, source_file, target_file, init_lr = 1e-3, training_epochs = 1000, batch_size = 100, batch_test = 100, version = 0):
+    def training(self, source_file, target_file, init_lr = 5e-4, training_epochs = 1000, batch_size = 30, batch_test = 60):
         
         sess = tf.Session()
+        K.set_session(sess)
+        #self.create()
+        #self.create_block()
+        #self.create_mutan()
+        self.create_block(version = 1, cdan = 0)
+        
         """
         ----------------
         MODEL DEFINITION
@@ -170,9 +176,6 @@ class AdversarialNet(AlexNet):
         discriminator_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits = self.discriminator, labels = domain_label))
         adver_loss = discriminator_loss + weight_decay_ad
         
-        """
-        #block adaptation version 2
-        
         skip_source_w = [v for v in tf.trainable_variables() if ('adapt/skip_connection_source/weights' in v.name)][0]
         skip_source_b = [v for v in tf.trainable_variables() if ('adapt/skip_connection_source/biases' in v.name)][0]
         skip_target_w = [v for v in tf.trainable_variables() if ('adapt/skip_connection_target/weights' in v.name)][0]
@@ -180,12 +183,6 @@ class AdversarialNet(AlexNet):
         
         print(skip_source_w.name, skip_source_b.name, skip_target_w.name, skip_target_b.name)
         difference_loss = (tf.reduce_sum(tf.square(skip_source_w - skip_target_w)) + tf.reduce_sum(tf.square(skip_source_b - skip_target_b)))
-        """
-        
-        #block adaptation version 3
-        
-        difference_loss = tf.add_n([tf.nn.l2_loss(v) for v in scratch_list if 'projection' in v.name])
-        print([v for v in scratch_list if 'projection' in v.name])
         loss = prediction_loss + weight_decay_not_ad - self.lamda * discriminator_loss + difference_loss
                 
         """
@@ -194,9 +191,9 @@ class AdversarialNet(AlexNet):
         --------------------
         """
         
-        print(adversarial_list)
-        print(scratch_list)
-        print(finetuning_list)
+        #print(adversarial_list)
+        #print(scratch_list)
+        #print(finetuning_list)
         
         min_var_list = scratch_list + finetuning_list
         adv_var_list = adversarial_list
@@ -211,7 +208,8 @@ class AdversarialNet(AlexNet):
         optimizer1 = tf.train.MomentumOptimizer(lr * 10, momentum = 0.9)
         optimizer2 = tf.train.MomentumOptimizer(lr, momentum = 0.9)
         optimizer3 = tf.train.MomentumOptimizer(lr * 10, momentum = 0.9)
-                
+        #optimizer3 = tf.train.AdamOptimizer(lr * 10)        
+        
         train_op1 = optimizer1.apply_gradients(grads_and_vars = min_gradients[:len(scratch_list)])
         train_op2 = optimizer2.apply_gradients(grads_and_vars = min_gradients[len(scratch_list):])
         train_op3 = optimizer3.apply_gradients(grads_and_vars = adv_gradients)
@@ -226,8 +224,46 @@ class AdversarialNet(AlexNet):
         -----------------------------------------------
         """
         
-        size = len(open(source_file).readlines())
-        valmode = True
+        """
+        with tf.device('/cpu:0'):
+            
+            train_source_data = ImageDataGenerator(preprocessing_function = preprocess_input,
+                                                   horizontal_flip = True,
+                                                   rotation_range = 40,
+                                                   shear_range=0.2)
+            train_target_data = ImageDataGenerator(preprocessing_function = preprocess_input,
+                                                   horizontal_flip = True,
+                                                   rotation_range = 40,
+                                                   shear_range=0.2)
+            val_data = ImageDataGenerator(preprocessing_function = preprocess_input)
+            
+            train_source_generator = train_source_data.flow_from_directory(source_file,
+                                                                           batch_size = batch_size,
+                                                                           target_size = (size, size),
+                                                                           class_mode = 'categorical',
+                                                                           shuffle = True)
+            
+            train_target_generator = train_target_data.flow_from_directory(target_file,
+                                                                           batch_size = batch_size,
+                                                                           target_size = (size, size),
+                                                                           class_mode = 'categorical',
+                                                                           shuffle = True)
+            
+            val_generator = val_data.flow_from_directory(target_file,
+                                                         batch_size = batch_test,
+                                                         target_size = (size, size),
+                                                         class_mode = 'categorical')
+            
+            
+            
+            
+            #next_batch_sr = train_source_generator.next()
+            #next_batch_tr = train_target_generator.next()
+            #next_batch_val = val_generator.next() 
+            
+            train_batches_per_epoch = int(np.floor(train_source_generator.n/ train_source_generator.batch_size))
+            val_batches_per_epoch = int(np.ceil(val_generator.n / val_generator.batch_size))
+        """
         
         with tf.device('/cpu:0'):
             
@@ -243,42 +279,36 @@ class AdversarialNet(AlexNet):
                                      num_classes=self.n_class,
                                      shuffle=True, size=size)
             
-            val_data = []
-            for t in range(9):
-                i = t // 3
-                j = t % 3
-                val_data.append(ImageDataGenerator(target_file,
+            val_data = ImageDataGenerator(target_file,
                                       mode='inference',
-                                      batch_size=batch_test,
+                                      batch_size=batch_size,
                                       num_classes=self.n_class,
-                                      shuffle=False, fulval=valmode, pos_x = i, pos_y = j))
+                                      shuffle=False, fulval=valmode)
             
             iterator_source_train = Iterator.from_structure(train_source_data.data.output_types,
                                        train_source_data.data.output_shapes)
             iterator_target_train = Iterator.from_structure(train_target_data.data.output_types,
                                        train_target_data.data.output_shapes)
-            
-            iterator_val = []
-            for t in range(9):
-                iterator_val.append(Iterator.from_structure(val_data[t].data.output_types,
-                                       val_data[t].data.output_shapes))
+            iterator_val = Iterator.from_structure(val_data.data.output_types,
+                                       val_data.data.output_shapes)
             
             next_batch_sr = iterator_source_train.get_next()
             next_batch_tr = iterator_target_train.get_next()
-            
-            next_batch_val = []
-            for t in range(9):
-                next_batch_val.append(iterator_val[t].get_next())
+            next_batch_val = iterator_val.get_next()
             
         train_batches_per_epoch = int(np.floor(train_source_data.data_size/batch_size))
-        val_batches_per_epoch = int(np.ceil(val_data[0].data_size / batch_size))
+        val_batches_per_epoch = int(np.ceil(val_data.data_size / batch_size))
         
         training_source_init_op = iterator_source_train.make_initializer(train_source_data.data)
         training_target_init_op = iterator_target_train.make_initializer(train_target_data.data)
+        validation_init_op = iterator_val.make_initializer(val_data.data)
         
-        validation_init_op = []
-        for t in range(9):
-            validation_init_op.append(iterator_val[t].make_initializer(val_data[t].data))
+        
+        """
+        training_source_init_op = train_source_generator.make_initializer(train_source_data.data)
+        training_target_init_op = train_target_generator.make_initializer(train_target_data.data)
+        validation_init_op = val_generator.make_initializer(train_target_data.data)
+        """
         
         """
         ---------------------------
@@ -298,15 +328,21 @@ class AdversarialNet(AlexNet):
         
         init = tf.global_variables_initializer()
         sess.run(init)
-                
-        self.load_initial_weight(sess)
         
-        print(config)
+        for layer in self.model.layers:
+            self.model.get_layer(layer.name).set_weights(self.pretrain_weight[layer.name])
+        #self.load_initial_weight(sess)
+        del self.pretrain_weight
+        gc.collect()
+        
         print(init_lr)
         print(train_batches_per_epoch)
         print(val_batches_per_epoch)
+        print(self.model.get_layer('res5c_branch2a').get_weights())
         print(source_file, target_file)
-        
+        #print(train_source_generator.class_indices)
+        #print(train_target_generator.class_indices)
+        #print(val_generator.class_indices)
         best = 0
         
         #print(sess.run([v for v in tf.trainable_variables() if 'conv1/weights' in v.name]))
@@ -320,6 +356,7 @@ class AdversarialNet(AlexNet):
             L_total = 0
             L_MMD = 0
             L_diff = 0
+            self.model.trainable = True
             
             for times in range(train_batches_per_epoch):
                 if times_pass == val_batches_per_epoch - 1:
@@ -332,54 +369,58 @@ class AdversarialNet(AlexNet):
                 learning_rate = init_lr / (1. + 10.0 * p)**0.75
                 b = 1.0 * epochs / training_epochs
                 #print(learning_rate)
-                alpha = 2.0 / (1.0 + np.exp(-10.0 * epochs / training_epochs)) - 1.0 
+                alpha = 0.25#2.0 / (1.0 + np.exp(-10.0 * epochs / training_epochs)) - 1.0#min(0.3, 2.0 / (1.0 + np.exp(-10.0 * epochs / training_epochs)) - 1.0) 
                 #(1 - np.exp(-10.0 * epochs / training_epochs)) / (1 + np.exp(-10.0 * epochs / training_epochs)) 
                 
                 #begin = time.time()
                 x1, y1 = sess.run(next_batch_sr)
-                x2, y2 = sess.run(next_batch_tr)                
+                x2, y2 = sess.run(next_batch_tr)
                 #end = time.time()
                 #print("Loading: ", end - begin)
                 
-                #print(times, np.mean(x1), np.mean(x2))
                 #begin = time.time()
+                #print(times, np.mean(x1), np.mean(x2))
                 _, total_loss, pred_loss, M_loss, D_loss = sess.run([optimize, loss, prediction_loss, adver_loss, difference_loss], feed_dict = {self.source: x1, self.target : x2,
                                             one_hot_labels : y1, lr : learning_rate, self.keep_prob : self.KEEP_PROB_TRAINING, self.lamda : alpha, self.beta : b})
                 #end = time.time()
                 #print("Running: ",end - begin)
                 
+                #print(total_loss, pred_loss, M_loss)
+                
                 L_pred = L_pred + pred_loss
                 L_total = L_total + total_loss
                 L_MMD = L_MMD + M_loss
                 L_diff = L_diff + D_loss
-    
+            
+            
+            gc.collect()
+                
             if not (epochs % 10 == 9):
                 continue
             
+            self.model.trainable = False
             #print(sess.run([v for v in tf.trainable_variables() if 'conv1/weights' in v.name]))
             print(L_pred * 1.0 / train_batches_per_epoch)
-            print(L_MMD * 1.0 / train_batches_per_epoch)
+            print(L_MMD / train_batches_per_epoch)
             print(L_diff * 1.0 / train_batches_per_epoch)
+            print(alpha)
             print("TIMES: ", epochs, " LOSS: ", L_total * 1.0 / train_batches_per_epoch)
+            
+            sess.run(validation_init_op)
             
             test_acc = 0.
             num = 0.
-            for t in range(9):
-                sess.run(validation_init_op[t])
             
             for _ in range(val_batches_per_epoch):
                 val_input = 0
-                for t in range(9):    
-                    if True:#target_file == './testtxt/amazon.txt':
-                        if t != 4:
-                            continue
-                    img_batch, label_batch = sess.run(next_batch_val[t])
+                img_batch, label_batch = sess.run(next_batch_val)
+                #img_batch = self.crop_generator(img_batch, False)
                 #img_batch = np.reshape(img_batch, [-1 ,height, width, 3])
                 #print(img_batch.size)
-                    logits = sess.run([tf.nn.softmax(self.logits, axis = -1)], feed_dict={self.source: np.zeros(shape = (0,height, width,3), dtype = np.float32), self.target : img_batch, 
+                logits = sess.run([tf.nn.softmax(self.logits, axis = -1)], feed_dict={self.target: img_batch, self.source : np.zeros(shape = (0,height, width,3), dtype = np.float32), 
                                        self.keep_prob : self.KEEP_PROB_VALIDATION, self.beta : 1.0})
                                     
-                    val_input += logits[0]
+                val_input += logits[0]
                 
                 acc, num_ = sess.run([accuracy, accunum], feed_dict={prob: val_input, one_hot_labels: label_batch})
                 test_acc += acc
@@ -389,14 +430,13 @@ class AdversarialNet(AlexNet):
             best = max(best, test_acc / num)
             
         print (best)
-
+        
 if source_file == './testtxt/dslr.txt':
-    training_epochs = 700
+    training_epochs = 400
 elif source_file == './testtxt/webcam.txt' :
-    training_epochs = 600
+    training_epochs = 400
 else:
     training_epochs = 400 
 
-
-net = AdversarialNet(tf.placeholder(dtype = tf.float32, shape = [None, height, width, 3]), tf.placeholder(dtype = tf.float32, shape = [None, height, width, 3]))
+net = AdResNet(tf.placeholder(dtype = tf.float32, shape = [None, height, width, 3]), tf.placeholder(dtype = tf.float32, shape = [None, height, width, 3]))
 net.training(source_file, target_file, training_epochs = training_epochs)

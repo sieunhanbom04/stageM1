@@ -50,6 +50,19 @@ class AlexNet(object):
                 return relu
             
             return result
+        
+    def fc_xavier_zero(self, x, num_in, num_out, name, relu = True):
+        with tf.variable_scope(name) as scope:
+            weights = tf.get_variable('weights', shape = [num_in, num_out], initializer = tf.contrib.layers.xavier_initializer(), trainable = True)
+            biases = tf.get_variable('biases', shape = [num_out], initializer = tf.zeros_initializer(), trainable = True)
+            
+            result = tf.nn.xw_plus_b(x, weights, biases, name = scope.name)
+            
+            if relu:
+                relu = tf.nn.relu(result)
+                return relu
+            
+            return result
     
     def max_pool(self, x, h, w, stride_x, stride_y, name, padding = 'SAME'):
         return tf.nn.max_pool(x, ksize = [1, h, w, 1], strides = [1, stride_x, stride_y, 1], padding = padding, name = name) 

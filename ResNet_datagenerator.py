@@ -6,15 +6,16 @@ import cv2
 
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework.ops import convert_to_tensor
+from tensorflow.keras.applications.resnet50 import preprocess_input
 
 # BGR
 IMAGENET_MEAN = tf.constant([104.007, 116.669, 122.679], dtype=tf.float32)#tf.constant([103.939, 116.779, 123.68], dtype=tf.float32)
 IMAGENET_MEAN_FULL = np.load("ilsvrc_2012_mean.npy")
 IMAGENET_MEAN_FULL = np.transpose(IMAGENET_MEAN_FULL, [1,2,0])
-image_width = 227
-image_height = 227
+image_width = 224
+image_height = 224
 shape = 256
-crop = [tf.constant(0, dtype = tf.int32), tf.constant(14, dtype = tf.int32), tf.constant(28, dtype = tf.int32)]
+crop = [tf.constant(0, dtype = tf.int32), tf.constant(16, dtype = tf.int32), tf.constant(28, dtype = tf.int32)]
 
 Dataset = tf.data.Dataset
 class ImageDataGenerator(object):
@@ -129,7 +130,7 @@ class ImageDataGenerator(object):
         img_decoded = tf.image.resize_images(img_decoded, [256,256])
         img_decoded = img_decoded[:, :, ::-1]
         img_decoded = tf.subtract(tf.to_float(img_decoded), IMAGENET_MEAN_FULL)
-        img_decoded = tf.to_float(tf.random_crop(img_decoded, [227, 227, 3]))
+        img_decoded = tf.to_float(tf.random_crop(img_decoded, [224, 224, 3]))
         img_resized = tf.image.random_flip_left_right(img_decoded)
         """
         Dataaugmentation comes here.
